@@ -1,0 +1,7 @@
+project_id = "caenzlizkxbzlykajkes"
+
+[functions.analyze-product]
+verify_jwt = false
+
+[functions.generate-variations]
+verify_jwt = false
