@@ -42,16 +42,34 @@ export async function analyzeProduct(sessionId: string) {
   const { data, error } = await supabase.functions.invoke("analyze-product", {
     body: { sessionId },
   });
-  if (error) throw new Error(error.message);
+
+  if (error) {
+    const status = (error as any)?.context?.status;
+    const backendMessage = (data as any)?.error;
+    if (backendMessage) throw new Error(backendMessage);
+    if (status === 429) throw new Error("Rate limit exceeded. Please retry in a minute.");
+    if (status === 402) throw new Error("Billing or quota issue on the connected Gemini key.");
+    throw new Error(error.message);
+  }
+
   return data;
 }
 
 export async function generateVariations(sessionId: string) {
-  const { data, error } = await supabase.functions.invoke(
-    "generate-variations",
-    { body: { sessionId } }
-  );
-  if (error) throw new Error(error.message);
+  const { data, error } = await supabase.functions.invoke("generate-variations", {
+    body: { sessionId },
+  });
+
+  if (error) {
+    const status = (error as any)?.context?.status;
+    const backendMessage = (data as any)?.error;
+    if (backendMessage) throw new Error(backendMessage);
+    if (status === 429) throw new Error("Rate limit exceeded. Please retry in a minute.");
+    if (status === 402) throw new Error("Billing or quota issue on the connected Gemini key.");
+    if (status === 404) throw new Error("Configured Gemini image model was not found for your API key.");
+    throw new Error(error.message);
+  }
+
   return data;
 }
 
