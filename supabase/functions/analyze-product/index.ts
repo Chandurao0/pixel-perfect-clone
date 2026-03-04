@@ -16,20 +16,18 @@ serve(async (req) => {
     const { sessionId } = await req.json();
     if (!sessionId) throw new Error("sessionId is required");
 
-    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-    if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY is not configured");
+    const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
+    if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not configured");
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Update session status
     await supabase
       .from("design_sessions")
       .update({ status: "analyzing" })
       .eq("id", sessionId);
 
-    // Get uploaded images for this session
     const { data: sessionImages } = await supabase
       .from("session_images")
       .select("storage_path, angle_label")
@@ -39,98 +37,49 @@ serve(async (req) => {
       throw new Error("No images found for this session");
     }
 
-    // Get public URLs for the images
-    const imageUrls = sessionImages.map((img) => {
+    // Download images and convert to base64 for Gemini
+    const imageParts = [];
+    for (const img of sessionImages) {
       const { data } = supabase.storage
         .from("product-images")
         .getPublicUrl(img.storage_path);
-      return data.publicUrl;
-    });
+      
+      const imgResponse = await fetch(data.publicUrl);
+      const imgBuffer = await imgResponse.arrayBuffer();
+      const base64 = btoa(String.fromCharCode(...new Uint8Array(imgBuffer)));
+      const mimeType = img.storage_path.endsWith(".png") ? "image/png" : "image/jpeg";
+      
+      imageParts.push({
+        inline_data: { mime_type: mimeType, data: base64 },
+      });
+    }
 
-    // Build multimodal content for vision analysis
-    const imageContent = imageUrls.map((url) => ({
-      type: "image_url" as const,
-      image_url: { url },
-    }));
+    const analysisPrompt = `You are a product design analyst for artisan crafts. Analyse these artisan product images and return ONLY a valid JSON object (no markdown, no code fences) with these fields:
+- product_type (string)
+- primary_material (string)
+- dominant_colors (array of strings)
+- surface_patterns (array of strings)
+- shape_description (string)
+- texture (string)
+- finish (string)
+- suggested_category (one of: Pottery, Jewelry, Weaving, Woodwork, Other)`;
 
     const response = await fetch(
-      "https://ai.gateway.lovable.dev/v1/chat/completions",
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${LOVABLE_API_KEY}`,
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "google/gemini-2.5-flash",
-          messages: [
+          contents: [
             {
-              role: "system",
-              content: `You are a product design analyst for artisan crafts. Analyse the uploaded product images and return a structured JSON analysis. Be specific about the craft details.`,
-            },
-            {
-              role: "user",
-              content: [
-                {
-                  type: "text",
-                  text: "Analyse these artisan product images. Return a JSON object with: product_type (string), primary_material (string), dominant_colors (array of strings), surface_patterns (array of strings), shape_description (string), texture (string), finish (string), suggested_category (one of: Pottery, Jewelry, Weaving, Woodwork, Other).",
-                },
-                ...imageContent,
+              parts: [
+                { text: analysisPrompt },
+                ...imageParts,
               ],
             },
           ],
-          tools: [
-            {
-              type: "function",
-              function: {
-                name: "analyze_product",
-                description:
-                  "Return structured analysis of the artisan product",
-                parameters: {
-                  type: "object",
-                  properties: {
-                    product_type: { type: "string" },
-                    primary_material: { type: "string" },
-                    dominant_colors: {
-                      type: "array",
-                      items: { type: "string" },
-                    },
-                    surface_patterns: {
-                      type: "array",
-                      items: { type: "string" },
-                    },
-                    shape_description: { type: "string" },
-                    texture: { type: "string" },
-                    finish: { type: "string" },
-                    suggested_category: {
-                      type: "string",
-                      enum: [
-                        "Pottery",
-                        "Jewelry",
-                        "Weaving",
-                        "Woodwork",
-                        "Other",
-                      ],
-                    },
-                  },
-                  required: [
-                    "product_type",
-                    "primary_material",
-                    "dominant_colors",
-                    "surface_patterns",
-                    "shape_description",
-                    "texture",
-                    "finish",
-                    "suggested_category",
-                  ],
-                  additionalProperties: false,
-                },
-              },
-            },
-          ],
-          tool_choice: {
-            type: "function",
-            function: { name: "analyze_product" },
+          generationConfig: {
+            responseMimeType: "application/json",
           },
         }),
       }
@@ -138,7 +87,7 @@ serve(async (req) => {
 
     if (!response.ok) {
       const errText = await response.text();
-      console.error("AI gateway error:", response.status, errText);
+      console.error("Gemini API error:", response.status, errText);
       if (response.status === 429) {
         await supabase
           .from("design_sessions")
@@ -149,18 +98,22 @@ serve(async (req) => {
           { status: 429, headers: { ...corsHeaders, "Content-Type": "application/json" } }
         );
       }
-      throw new Error(`AI gateway error: ${response.status}`);
+      throw new Error(`Gemini API error: ${response.status}`);
     }
 
     const result = await response.json();
-    const toolCall = result.choices?.[0]?.message?.tool_calls?.[0];
+    const textContent = result.candidates?.[0]?.content?.parts?.[0]?.text;
     let analysis = {};
 
-    if (toolCall?.function?.arguments) {
-      analysis = JSON.parse(toolCall.function.arguments);
+    if (textContent) {
+      try {
+        analysis = JSON.parse(textContent);
+      } catch {
+        console.error("Failed to parse analysis JSON:", textContent);
+        throw new Error("Failed to parse AI analysis response");
+      }
     }
 
-    // Save analysis to session
     await supabase
       .from("design_sessions")
       .update({
