@@ -72,7 +72,8 @@ serve(async (req) => {
               "Content-Type": "application/json",
             },
             body: JSON.stringify({
-              model: "google/gemini-2.5-flash-image",
+              model: "google/gemini-2.5-flash-image-preview",
+              modalities: ["text", "image"],
               messages: [
                 {
                   role: "user",
@@ -86,7 +87,6 @@ serve(async (req) => {
         if (!response.ok) {
           if (response.status === 429) {
             console.error("Rate limited during image generation");
-            // Wait and retry once
             await new Promise((r) => setTimeout(r, 5000));
             continue;
           }
@@ -97,40 +97,46 @@ serve(async (req) => {
 
         const result = await response.json();
         const content = result.choices?.[0]?.message?.content;
+        console.log("Response content type:", typeof content, Array.isArray(content) ? "array" : "");
 
-        // Gemini image model returns inline_data with base64
         let imageUrl = "";
 
         if (Array.isArray(content)) {
+          // Find image_url part with base64 data URI
           const imagePart = content.find(
-            (p: any) => p.type === "image_url" || p.inline_data
+            (p: any) => p.type === "image_url"
           );
-          if (imagePart?.inline_data) {
-            // Upload base64 image to storage
-            const base64Data = imagePart.inline_data.data;
-            const mimeType = imagePart.inline_data.mime_type || "image/png";
-            const ext = mimeType.includes("jpeg") ? "jpg" : "png";
-            const fileName = `variations/${sessionId}/${crypto.randomUUID()}.${ext}`;
+          if (imagePart?.image_url?.url) {
+            const dataUri = imagePart.image_url.url;
+            // Parse base64 data URI: data:image/png;base64,xxxxx
+            const match = dataUri.match(/^data:(image\/\w+);base64,(.+)$/);
+            if (match) {
+              const mimeType = match[1];
+              const base64Data = match[2];
+              const ext = mimeType.includes("jpeg") ? "jpg" : "png";
+              const fileName = `variations/${sessionId}/${crypto.randomUUID()}.${ext}`;
 
-            const binaryData = Uint8Array.from(atob(base64Data), (c) =>
-              c.charCodeAt(0)
-            );
+              const binaryData = Uint8Array.from(atob(base64Data), (c) =>
+                c.charCodeAt(0)
+              );
 
-            const { error: uploadError } = await supabase.storage
-              .from("product-images")
-              .upload(fileName, binaryData, { contentType: mimeType });
-
-            if (!uploadError) {
-              const { data: urlData } = supabase.storage
+              const { error: uploadError } = await supabase.storage
                 .from("product-images")
-                .getPublicUrl(fileName);
-              imageUrl = urlData.publicUrl;
+                .upload(fileName, binaryData, { contentType: mimeType });
+
+              if (!uploadError) {
+                const { data: urlData } = supabase.storage
+                  .from("product-images")
+                  .getPublicUrl(fileName);
+                imageUrl = urlData.publicUrl;
+              } else {
+                console.error("Upload error:", uploadError);
+              }
+            } else if (dataUri.startsWith("http")) {
+              imageUrl = dataUri;
             }
-          } else if (imagePart?.type === "image_url") {
-            imageUrl = imagePart.image_url?.url || "";
           }
         } else if (typeof content === "string") {
-          // Text-only response — no image generated, skip
           console.log("Text-only response for variation:", spec.label);
           continue;
         }
