@@ -16,14 +16,13 @@ serve(async (req) => {
     const { sessionId } = await req.json();
     if (!sessionId) throw new Error("sessionId is required");
 
-    const LOVABLE_API_KEY = Deno.env.get("LOVABLE_API_KEY");
-    if (!LOVABLE_API_KEY) throw new Error("LOVABLE_API_KEY is not configured");
+    const GEMINI_API_KEY = Deno.env.get("GEMINI_API_KEY");
+    if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not configured");
 
     const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
     const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
     const supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Get session analysis
     const { data: session } = await supabase
       .from("design_sessions")
       .select("*")
@@ -35,26 +34,25 @@ serve(async (req) => {
     const analysis = session.analysis as Record<string, any>;
     if (!analysis) throw new Error("No analysis found — run analyze-product first");
 
-    // Build 4 variation prompts based on the analysis
     const variationSpecs = [
       {
         label: `${analysis.product_type} with Geometric Patterns`,
-        prompt: `A photorealistic ${analysis.product_type} made of ${analysis.primary_material}. Modified with bold geometric patterns in blue and turquoise colors. ${analysis.shape_description}. ${analysis.texture} texture with a glazed finish. Artisan handcrafted quality. Product photography on a clean white background. Ultra high resolution.`,
+        prompt: `Generate an image of a photorealistic ${analysis.product_type} made of ${analysis.primary_material}. Modified with bold geometric patterns in blue and turquoise colors. ${analysis.shape_description}. ${analysis.texture} texture with a glazed finish. Artisan handcrafted quality. Product photography on a clean white background. Ultra high resolution.`,
         tags: ["Pattern", "Color"],
       },
       {
         label: `Modern ${analysis.product_type} in Matte Black`,
-        prompt: `A photorealistic ${analysis.product_type} with an elongated modern form. Matte black finish with gold leaf accents. Made of ${analysis.primary_material}. Minimalist and contemporary design. Artisan handcrafted quality. Product photography on a clean white background. Ultra high resolution.`,
+        prompt: `Generate an image of a photorealistic ${analysis.product_type} with an elongated modern form. Matte black finish with gold leaf accents. Made of ${analysis.primary_material}. Minimalist and contemporary design. Artisan handcrafted quality. Product photography on a clean white background. Ultra high resolution.`,
         tags: ["Shape", "Finish"],
       },
       {
         label: `${analysis.product_type} with Natural Motifs`,
-        prompt: `A photorealistic ${analysis.product_type} made of ${analysis.primary_material}. Decorated with carved leaf and vine motifs. Sage green glaze with earth tone accents. ${analysis.shape_description}. Artisan handcrafted quality. Product photography on a clean white background. Ultra high resolution.`,
+        prompt: `Generate an image of a photorealistic ${analysis.product_type} made of ${analysis.primary_material}. Decorated with carved leaf and vine motifs. Sage green glaze with earth tone accents. ${analysis.shape_description}. Artisan handcrafted quality. Product photography on a clean white background. Ultra high resolution.`,
         tags: ["Color", "Pattern"],
       },
       {
         label: `Warm Floral ${analysis.product_type}`,
-        prompt: `A photorealistic ${analysis.product_type} made of ${analysis.primary_material}. Hand-painted with warm floral motifs in sunset orange and cream. Rounded bowl shape. Glossy glaze finish. Artisan handcrafted quality. Product photography on a clean white background. Ultra high resolution.`,
+        prompt: `Generate an image of a photorealistic ${analysis.product_type} made of ${analysis.primary_material}. Hand-painted with warm floral motifs in sunset orange and cream. Rounded bowl shape. Glossy glaze finish. Artisan handcrafted quality. Product photography on a clean white background. Ultra high resolution.`,
         tags: ["Shape", "Color"],
       },
     ];
@@ -63,23 +61,22 @@ serve(async (req) => {
 
     for (const spec of variationSpecs) {
       try {
+        console.log("Generating variation:", spec.label);
+
         const response = await fetch(
-          "https://ai.gateway.lovable.dev/v1/chat/completions",
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${GEMINI_API_KEY}`,
           {
             method: "POST",
-            headers: {
-              Authorization: `Bearer ${LOVABLE_API_KEY}`,
-              "Content-Type": "application/json",
-            },
+            headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              model: "google/gemini-2.5-flash-image-preview",
-              modalities: ["text", "image"],
-              messages: [
+              contents: [
                 {
-                  role: "user",
-                  content: spec.prompt,
+                  parts: [{ text: spec.prompt }],
                 },
               ],
+              generationConfig: {
+                responseModalities: ["IMAGE", "TEXT"],
+              },
             }),
           }
         );
@@ -91,75 +88,67 @@ serve(async (req) => {
             continue;
           }
           const errText = await response.text();
-          console.error(`Image generation error: ${response.status}`, errText);
+          console.error(`Gemini image error: ${response.status}`, errText);
           continue;
         }
 
         const result = await response.json();
-        const content = result.choices?.[0]?.message?.content;
-        console.log("Response content type:", typeof content, Array.isArray(content) ? "array" : "");
+        const parts = result.candidates?.[0]?.content?.parts;
 
-        let imageUrl = "";
-
-        if (Array.isArray(content)) {
-          // Find image_url part with base64 data URI
-          const imagePart = content.find(
-            (p: any) => p.type === "image_url"
-          );
-          if (imagePart?.image_url?.url) {
-            const dataUri = imagePart.image_url.url;
-            // Parse base64 data URI: data:image/png;base64,xxxxx
-            const match = dataUri.match(/^data:(image\/\w+);base64,(.+)$/);
-            if (match) {
-              const mimeType = match[1];
-              const base64Data = match[2];
-              const ext = mimeType.includes("jpeg") ? "jpg" : "png";
-              const fileName = `variations/${sessionId}/${crypto.randomUUID()}.${ext}`;
-
-              const binaryData = Uint8Array.from(atob(base64Data), (c) =>
-                c.charCodeAt(0)
-              );
-
-              const { error: uploadError } = await supabase.storage
-                .from("product-images")
-                .upload(fileName, binaryData, { contentType: mimeType });
-
-              if (!uploadError) {
-                const { data: urlData } = supabase.storage
-                  .from("product-images")
-                  .getPublicUrl(fileName);
-                imageUrl = urlData.publicUrl;
-              } else {
-                console.error("Upload error:", uploadError);
-              }
-            } else if (dataUri.startsWith("http")) {
-              imageUrl = dataUri;
-            }
-          }
-        } else if (typeof content === "string") {
-          console.log("Text-only response for variation:", spec.label);
+        if (!parts) {
+          console.log("No parts in response for:", spec.label);
           continue;
         }
 
-        if (imageUrl) {
-          variationResults.push({
-            session_id: sessionId,
-            image_url: imageUrl,
-            label: spec.label,
-            tags: spec.tags,
-          });
+        let imageUrl = "";
+
+        for (const part of parts) {
+          if (part.inlineData) {
+            const { mimeType, data: base64Data } = part.inlineData;
+            const ext = mimeType?.includes("jpeg") ? "jpg" : "png";
+            const fileName = `variations/${sessionId}/${crypto.randomUUID()}.${ext}`;
+
+            const binaryData = Uint8Array.from(atob(base64Data), (c) =>
+              c.charCodeAt(0)
+            );
+
+            const { error: uploadError } = await supabase.storage
+              .from("product-images")
+              .upload(fileName, binaryData, { contentType: mimeType || "image/png" });
+
+            if (!uploadError) {
+              const { data: urlData } = supabase.storage
+                .from("product-images")
+                .getPublicUrl(fileName);
+              imageUrl = urlData.publicUrl;
+              console.log("Uploaded variation image:", fileName);
+            } else {
+              console.error("Upload error:", uploadError);
+            }
+            break; // Use first image
+          }
         }
+
+        if (!imageUrl) {
+          console.log("No image generated for:", spec.label);
+          continue;
+        }
+
+        variationResults.push({
+          session_id: sessionId,
+          image_url: imageUrl,
+          label: spec.label,
+          tags: spec.tags,
+        });
       } catch (err) {
         console.error(`Error generating variation ${spec.label}:`, err);
       }
     }
 
-    // Insert variations into DB
     if (variationResults.length > 0) {
       await supabase.from("design_variations").insert(variationResults);
     }
 
-    // Update session status
     await supabase
       .from("design_sessions")
       .update({
